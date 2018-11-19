@@ -16,24 +16,29 @@ def stochk(df, period):
     return (df['m_cap_close'] - min_price) / (max_price - min_price)
 
 
-def augment_df(df, set_labels=True):
-    df['m_cap_open'] = df['volume'] * df['close']
-    df['m_cap_close'] = df['volume'] * df['close']
-    df['low'] = df[['open', 'close']].min(axis=1)
-    df['high'] = df[['open', 'close']].max(axis=1)
-    df['m_cap_low'] = df[['m_cap_open', 'm_cap_close']].min(axis=1)
-    df['m_cap_high'] = df[['m_cap_open', 'm_cap_close']].max(axis=1)
+def attach_market_level_indicators(df):
+    market_agg_df = df.groupby(['time']).mean()
+    market_agg_df['m_cap_open'] = market_agg_df['volume'] * market_agg_df['close']
+    market_agg_df['m_cap_close'] = market_agg_df['volume'] * market_agg_df['close']
+    market_agg_df['low'] = market_agg_df[['open', 'close']].min(axis=1)
+    market_agg_df['high'] = market_agg_df[['open', 'close']].max(axis=1)
+    market_agg_df['m_cap_low'] = market_agg_df[['m_cap_open', 'm_cap_close']].min(axis=1)
+    market_agg_df['m_cap_high'] = market_agg_df[['m_cap_open', 'm_cap_close']].max(axis=1)
 
     # df = pdt.TaDataFrame(df.reset_index(), indicators=['stochk_14', 'stochk_30', 'atr_30', 'vol_14', 'vol_30'])
-    df['stochk_14'] = stochk(df, 14)
-    df['stochk_30'] = stochk(df, 30)
-    df['vol_14'] = df['volume'] / df['volume'].rolling(14).max()
-    df['vol_30'] = df['volume'] / df['volume'].rolling(30).max()
+    market_agg_df['stochk_14'] = stochk(market_agg_df, 14)
+    market_agg_df['stochk_30'] = stochk(market_agg_df, 30)
+    market_agg_df['vol_14'] = market_agg_df['volume'] / market_agg_df['volume'].rolling(14).max()
+    market_agg_df['vol_30'] = market_agg_df['volume'] / market_agg_df['volume'].rolling(30).max()
     # df['atr_30'] = df['atr_30'] / df['atr_30'].rolling(30).max()
 
-    if set_labels:
-        df.loc[df['returnsOpenNextMktres10'] >= 0, 'label'] = 1
-        df.loc[df['returnsOpenNextMktres10'] <= 0, 'label'] = -1
+    return pd.merge(df,
+                    market_agg_df.reset_index()[['stochk_14', 'stochk_30', 'vol_14', 'vol_30', 'time']], on=['time'])
+
+
+def add_labels(df):
+    df.loc[df['returnsOpenNextMktres10'] >= 0, 'label'] = 1
+    df.loc[df['returnsOpenNextMktres10'] <= 0, 'label'] = -1
 
     return df
 
@@ -41,20 +46,40 @@ def augment_df(df, set_labels=True):
 def build_prediction_model(market_df, features):
     tree = RandomForestClassifier(n_estimators=100, max_depth=5, max_features=2, min_samples_leaf=100)
 
-    # print('Fitting the tree...')
+    print('Fitting the tree...')
     tree.fit(market_df.dropna()[features], market_df.dropna()[['label']])
-    # print('Done fitting the tree...')
+    print('Done fitting the tree...')
     return tree
 
 
 def make_random_predictions(market_obs_df, estimator, predictions_df=None, calc_score=True):
-    x = market_obs_df[features]
+    print("Predicting the confidence values...")
+    x = market_obs_df[features].fillna(0)
     if calc_score:
         print(estimator.score(x, market_obs_df[['label']]))
-    calc = estimator.predict_proba(x).max(axis=1) * estimator.predict(x)
+    calc = (estimator.predict_proba(x) * 2)[:, 1] - 1
     if predictions_df is not None:
         predictions_df['confidenceValue'] = calc
     return calc
+
+
+def fetch_test_data_at_once():
+    print("Fetching the test data...")
+    market_obs_df = None
+    predictions_template_df = None
+
+    for (m_df, n_df, p_df) in env.get_prediction_days():
+        env.predict(p_df)
+        p_df['time'] = m_df.time.min()
+        if market_obs_df is None:
+            market_obs_df = m_df
+            predictions_template_df = p_df
+        else:
+            market_obs_df = market_obs_df.append(m_df, ignore_index=True)
+            predictions_template_df = predictions_template_df.append(p_df, ignore_index=True)
+
+    print("Done, fetching the test data...")
+    return market_obs_df, predictions_template_df
 
 
 if __name__ == '__main__':
@@ -62,34 +87,25 @@ if __name__ == '__main__':
     all_market_train_df, all_news_train_df = env.get_training_data()
     warnings.filterwarnings('ignore')
 
+    all_market_train_df = attach_market_level_indicators(all_market_train_df)
+    all_market_train_df = add_labels(all_market_train_df)
+
     features = ['returnsClosePrevMktres1', 'returnsClosePrevMktres10', 'stochk_14', 'stochk_30', 'vol_14', 'vol_30']
+    estimator = build_prediction_model(all_market_train_df.tail(100000), features=features)
 
-    df = all_market_train_df.groupby(['time']).mean()
-    df = augment_df(df)
-    merged_train_df = pd.merge(all_market_train_df,
-                               df.reset_index()[['stochk_14', 'stochk_30', 'vol_14', 'vol_30', 'time']], on=['time'])
-    merged_train_df.loc[merged_train_df['returnsOpenNextMktres10'] >= 0, 'label'] = 1
-    merged_train_df.loc[merged_train_df['returnsOpenNextMktres10'] <= 0, 'label'] = -1
+    test_df, predictions_template_df = fetch_test_data_at_once()
+    test_df = attach_market_level_indicators(test_df)
+    test_df['returnsOpenNextMktres10'] = test_df.groupby(['assetCode'])['returnsOpenPrevMktres10'].shift(-11).fillna(0)
+    test_df = add_labels(test_df)
 
-    estimator = build_prediction_model(merged_train_df.tail(10000), features=features)
+    make_random_predictions(test_df, estimator, predictions_template_df)
 
-    days = env.get_prediction_days()
-    for (market_obs_df, news_obs_df, predictions_template_df) in days:
-        sample_time = market_obs_df['time'].tail(1)
-        print(sample_time)
-        all_market_train_df = all_market_train_df.append(market_obs_df)
-        df = all_market_train_df.groupby(['time']).mean()
-        df = augment_df(df)
-        merged_train_df = pd.merge(all_market_train_df,
-                                   df.reset_index()[['stochk_14', 'stochk_30', 'vol_14', 'vol_30', 'time']],
-                                   on=['time'])
-        merged_train_df.loc[merged_train_df['returnsOpenNextMktres10'] >= 0, 'label'] = 1
-        merged_train_df.loc[merged_train_df['returnsOpenNextMktres10'] <= 0, 'label'] = -1
+    # Score estimation
+    test_df['returns'] = predictions_template_df['confidenceValue'] * test_df['returnsOpenNextMktres10']
+    day_returns = test_df.groupby('time')['returns'].sum()
+    print('LB:', day_returns.mean() / day_returns.std())
+    # 0.28056 is the result after Kaggle submission
 
-        x = merged_train_df[features].tail(market_obs_df['assetCode'].count()).fillna(0)
-        score = ((estimator.predict_proba(x).max(axis=1) - 0.5) * estimator.predict(x))
-        # print(score)
-        predictions_template_df['confidenceValue'] = score * -1
-        env.predict(predictions_template_df)
-
-    env.write_submission_file()
+    predictions_template_df['time'] = predictions_template_df['time'].dt.date
+    predictions_template_df[['time', 'assetCode', 'confidenceValue']].to_csv('submission.csv', index=False,
+                                                                             float_format='%.8f')
